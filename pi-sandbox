@@ -8,6 +8,9 @@
 #                ~/.pi-sandbox-home   (persistent sandbox home)
 #   read-only  : ~/.pi/agent — auth.json, extensions/, npm/, bin/, install/
 #                /usr, /etc — the rest of the system is not mounted at all
+#                host dev toolchains (uv, cargo, nvm, pyenv, …) — mounted at
+#                their original absolute paths so .venv/bin/python and friends
+#                keep resolving; see sandbox-toolchains.sh
 #   fresh copy : settings.json, models-store.json — Pi writes lock files
 #                (<file>.lock dirs) next to these, so they must be writable;
 #                they are copied from the host on every launch
@@ -23,6 +26,13 @@ command -v bwrap >/dev/null || { echo "pi-sandbox: bwrap is required" >&2; exit 
 
 AGENT="$HOME/.pi/agent"
 STATE="$HOME/.pi-sandbox-home"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+# Expose host dev toolchains read-only at their original absolute paths so
+# absolute interpreter symlinks (e.g. .venv/bin/python) keep resolving.
+# shellcheck source=sandbox-toolchains.sh
+source "$SCRIPT_DIR/sandbox-toolchains.sh"
+toolchain_collect
 
 if [ "$PWD" = "$HOME" ]; then
   echo "pi-sandbox: refusing to run with \$HOME as the working directory" >&2
@@ -34,6 +44,11 @@ mkdir -p "$STATE/.pi/agent"
 for f in settings.json models-store.json; do
   [ -f "$AGENT/$f" ] && cp "$AGENT/$f" "$STATE/.pi/agent/$f"
 done
+
+# PATH: Pi's own launcher, the host toolchain bin dirs, then the system.
+sandbox_path="$AGENT/bin"
+for d in "${TOOLCHAIN_PATH_DIRS[@]}"; do sandbox_path+=":$d"; done
+sandbox_path+=":/usr/local/bin:/usr/bin:/bin"
 
 # Mount order matters: every exception must come after the mount that covers
 # its parent (--bind "$STATE" "$HOME" shadows the real home).
@@ -52,6 +67,15 @@ mounts=(
   --bind "$STATE" "$HOME"
   --bind "$PWD" "$PWD"
 )
+
+# Host toolchains, at their original absolute paths (sandbox-toolchains.sh).
+for i in "${!TOOLCHAIN_MOUNT_PATH[@]}"; do
+  case "${TOOLCHAIN_MOUNT_MODE[$i]}" in
+    rw) mounts+=(--bind "${TOOLCHAIN_MOUNT_PATH[$i]}" "${TOOLCHAIN_MOUNT_PATH[$i]}") ;;
+    *) mounts+=(--ro-bind "${TOOLCHAIN_MOUNT_PATH[$i]}" "${TOOLCHAIN_MOUNT_PATH[$i]}") ;;
+  esac
+done
+
 ro "$AGENT/auth.json"
 ro "$AGENT/extensions"
 ro "$AGENT/npm"
@@ -65,7 +89,7 @@ mounts+=(
   --setenv HOME "$HOME"
   --setenv USER "$USER"
   --setenv SHELL "${SHELL:-/bin/bash}"
-  --setenv PATH "$AGENT/bin:/usr/local/bin:/usr/bin:/bin"
+  --setenv PATH "$sandbox_path"
   --setenv TERM "${TERM:-xterm-256color}"
   --setenv LANG "${LANG:-C.UTF-8}"
 )

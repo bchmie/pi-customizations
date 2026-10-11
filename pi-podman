@@ -11,11 +11,19 @@
 #                (<file>.lock) next to these, so they must be writable;
 #                copied from the host on every launch
 #   read-only  : ~/.pi/agent — auth.json, extensions/, npm/, bin/, install/
+#                host dev toolchains (uv, cargo, nvm, pyenv, …) — mounted at
+#                their original absolute paths so .venv/bin/python and friends
+#                keep resolving; see sandbox-toolchains.sh
 #   absent     : everything else on the host — other projects, ~/.ssh, ~/.gnupg
+#
+# The container's home is the host's $HOME path (not /root) so the sandbox home
+# and every toolchain mount keep the same absolute path as on the host. This is
+# what makes venv/shims symlinks portable in both directions.
+#
 # Network: rootless networking (pasta) — NOT isolated, provider API reachable.
 # SELinux: container label confinement is disabled (label=disable) to avoid
 #          relabeling host files; the boundary is the container namespaces.
-# Usage: pi-sandbox-podman [pi arguments]   (first run builds the image)
+# Usage: pi-podman [pi arguments]   (first run builds the image)
 
 set -euo pipefail
 
@@ -24,6 +32,12 @@ command -v podman >/dev/null || { echo "pi-podman: podman is required" >&2; exit
 AGENT="$HOME/.pi/agent"
 STATE="$HOME/.pi-sandbox-home"   # shared with pi-sandbox (bwrap)
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+# Expose host dev toolchains read-only at their original absolute paths so
+# absolute interpreter symlinks (e.g. .venv/bin/python) keep resolving.
+# shellcheck source=sandbox-toolchains.sh
+source "$SCRIPT_DIR/sandbox-toolchains.sh"
+toolchain_collect
 
 if [ "$PWD" = "$HOME" ]; then
   echo "pi-podman: refusing to run with \$HOME as the working directory" >&2
@@ -44,23 +58,41 @@ fi
 tty_flags=()
 [ -t 0 ] && [ -t 1 ] && tty_flags=(-it)
 
+# PATH: Pi's own launcher, the host toolchain bin dirs, then the system.
+sandbox_path="$AGENT/bin"
+for d in "${TOOLCHAIN_PATH_DIRS[@]}"; do sandbox_path+=":$d"; done
+sandbox_path+=":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 volumes=(
-  -v "$STATE:/root"
+  -v "$STATE:$HOME"
   -v "$PWD:$PWD"
-  -v "$AGENT/auth.json:/root/.pi/agent/auth.json:ro"
-  -v "$AGENT/extensions:/root/.pi/agent/extensions:ro"
-  -v "$AGENT/npm:/root/.pi/agent/npm:ro"
-  -v "$AGENT/bin:/root/.pi/agent/bin:ro"
-  -v "$AGENT/install:/root/.pi/agent/install:ro"
-  -v "$AGENT/sessions:/root/.pi/agent/sessions"
+  -v "$AGENT/auth.json:$HOME/.pi/agent/auth.json:ro"
+  -v "$AGENT/extensions:$HOME/.pi/agent/extensions:ro"
+  -v "$AGENT/npm:$HOME/.pi/agent/npm:ro"
+  -v "$AGENT/bin:$HOME/.pi/agent/bin:ro"
+  -v "$AGENT/install:$HOME/.pi/agent/install:ro"
+  -v "$AGENT/sessions:$HOME/.pi/agent/sessions"
 )
-[ -f "$AGENT/trust.json" ] && volumes+=(-v "$AGENT/trust.json:/root/.pi/agent/trust.json")
+[ -f "$AGENT/trust.json" ] && volumes+=(-v "$AGENT/trust.json:$HOME/.pi/agent/trust.json")
+
+# Host toolchains, at their original absolute paths (sandbox-toolchains.sh).
+for i in "${!TOOLCHAIN_MOUNT_PATH[@]}"; do
+  if [ "${TOOLCHAIN_MOUNT_MODE[$i]}" = rw ]; then
+    volumes+=(-v "${TOOLCHAIN_MOUNT_PATH[$i]}:${TOOLCHAIN_MOUNT_PATH[$i]}")
+  else
+    volumes+=(-v "${TOOLCHAIN_MOUNT_PATH[$i]}:${TOOLCHAIN_MOUNT_PATH[$i]}:ro")
+  fi
+done
 
 exec podman run --rm \
   "${tty_flags[@]}" \
   --security-opt label=disable \
   -e TERM \
+  -e HOME="$HOME" \
+  -e USER="${USER:-user}" \
+  -e LOGNAME="${LOGNAME:-${USER:-user}}" \
+  -e PATH="$sandbox_path" \
   "${volumes[@]}" \
   -w "$PWD" \
   pi-sandbox \
-  /root/.pi/agent/bin/pi "$@"
+  "$HOME/.pi/agent/bin/pi" "$@"

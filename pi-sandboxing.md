@@ -42,16 +42,63 @@ security boundaries; only OS-level isolation is.
 | Current project directory | read-write (mounted at the **same absolute path**, so sessions group identically to host runs) |
 | `~/.pi/agent/sessions` | read-write — `pi --continue` / `--resume` work normally and interleave with host history |
 | `~/.pi/agent/trust.json` | read-write — project-trust decisions persist |
-| `~/.pi/sandbox-home` | read-write — persistent sandbox home, **shared by both variants** |
+| `~/.pi-sandbox-home` | read-write — persistent sandbox home, **shared by both variants** |
 | `auth.json`, `extensions/`, `npm/`, `bin/`, `install/` | read-only — single source of truth; the sandbox cannot tamper with Pi's own config, extensions, or credential |
+| Host dev toolchains (`uv`, `cargo`, `nvm`, `pyenv`, `mise`, …) | read-only, mounted at their **original absolute paths** — see "Host toolchains" below |
 | `settings.json`, `models-store.json` | **fresh copy each launch** — see "lock dirs" below |
-| Everything else under `$HOME` | hidden (bwrap: shadowed by a tmpfs; Podman: simply not mounted) |
+| Everything else under `$HOME` (incl. `~/.cache`, and credential files like `~/.npmrc`, `~/.cargo/credentials.toml`) | hidden (bwrap: shadowed by a tmpfs; Podman: simply not mounted) |
 | `/etc`, `/usr`, rest of the system | read-only (bwrap) / container root filesystem (Podman) |
 | `/tmp`, `/run` | ephemeral |
 | Network | **not isolated** — shares the host network namespace (bwrap) / rootless `pasta` networking (Podman), so the provider API (`opencode.ai`) is reachable |
 
 In the bwrap variant the system is mounted as an explicit **allowlist**
 (`/usr` + `/etc` only): `/var`, `/opt`, `/srv` are not mounted at all.
+
+## Host toolchains (uv, cargo, nvm, …)
+
+The sandboxes hide `$HOME`, but host dev toolchains live there and create
+**absolute** symlinks. A uv venv, for example, records:
+
+```
+.venv/bin/python -> $HOME/.local/share/uv/python/cpython-3.13.5-…/bin/python3.13
+```
+
+With `.venv` bind-mounted from the project but `$HOME/.local/share/uv` hidden,
+that symlink dangles and `.venv/bin/pytest` cannot exec — the failure that
+motivated this layer. (`uv venv --relocatable` does **not** help: the symlink is
+still absolute.)
+
+`sandbox-toolchains.sh` fixes this by mounting a curated set of install roots
+**read-only at their original absolute paths**. Because the path is identical on
+both sides, absolute symlinks resolve, and anything the sandbox creates (a venv,
+a virtualenv) records paths that are also valid on the host.
+
+- **Defaults:** `~/.local/bin`, `~/.local/share/uv`, `~/.local/share/pipx`,
+  `~/.local/share/{mise,pnpm,fnm,virtualenvs,asdf}`, `~/.cargo/bin`,
+  `~/.rustup`, `~/.nvm`, `~/.pyenv`, `~/.bun/bin`, `~/.deno/bin`,
+  `~/.volta/bin`, `~/.npm-global/bin`, `~/.dotnet`, `~/.sdkman/candidates`,
+  `~/go/bin`. Off-default install locations are picked up from
+  `UV_PYTHON_INSTALL_DIR`, `CARGO_HOME`-adjacent vars, `GOPATH`, etc.
+- **Credential files are deliberately excluded** — `~/.cargo` is exposed only as
+  `bin/` (the rustup shims), so `~/.cargo/credentials.toml`, `~/.npmrc`,
+  `~/.m2/settings.xml`, `~/.config/pip`, `~/.config/uv`, `~/.netrc` stay hidden.
+- **Caches stay sandbox-local.** `~/.cache/uv`, `~/.cache/pip`, etc. resolve
+  under the sandbox home (which shadows the real `$HOME`), so `uv sync`,
+  `uv run`, `cargo build` and friends work without writing to the host.
+- **Override per machine:** `${XDG_CONFIG_HOME:-~/.config}/pi-sandbox/toolchains.conf`,
+  one entry per line — `ro <path>`, `rw <path>`, or `- <path>` to drop a default.
+  Paths are absolute or relative to `$HOME`. Example to allow installing a new
+  interpreter/tool (writes persist to the host):
+
+  ```
+  rw .local/share/uv
+  - .dotnet
+  ```
+
+`pi-podman` additionally sets the container's home to the **host's `$HOME`**
+(not `/root`) so that both the sandbox home and every toolchain mount keep the
+same absolute path as on the host. That is what makes the symlinks portable in
+both directions.
 
 ## Findings that shaped the design
 
@@ -86,6 +133,11 @@ In the bwrap variant the system is mounted as an explicit **allowlist**
    `~/.pi/agent/sessions` (full `--continue`/`--resume` parity, sessions
    interleaved with host history). The alternative — a sandbox-only history
    via a separate state dir — was rejected, but is a one-line change.
+8. **Host toolchains create absolute symlinks.** Hiding `$HOME` breaks
+   host-created venvs even when `.venv` is bind-mounted. The fix is to expose
+   the install roots read-only at their original paths — and, in Podman, to
+   mount the state at the host `$HOME` path rather than `/root` so the paths
+   line up. See "Host toolchains" above.
 
 ## bwrap vs Podman
 
@@ -93,7 +145,8 @@ In the bwrap variant the system is mounted as an explicit **allowlist**
 |---|---|---|
 | Startup latency | instant | instant after first `podman build` (~1 min, needs network) |
 | Isolation | unprivileged user/pid/ipc/uts/cgroup namespaces | full container namespaces + image layering |
-| Tools available | host tools (`git`, `rg`, compilers) read-only | only what's in the image (git, ripgrep; extend `Containerfile`) |
+| Tools available | host tools + host dev toolchains (read-only) | image tools (`git`, `ripgrep`) + host dev toolchains (read-only) |
+| Home path | `$HOME` (sandbox home shadows it) | `$HOME` (host path; **not** `/root`, so absolute toolchain symlinks resolve) |
 | Pi version | always identical to host (bind-mounted) | always identical to host (bind-mounted) |
 | Filesystem allowlist | explicit: `/usr`, `/etc` | container rootfs; host not mounted except listed binds |
 | SELinux | n/a (no container) | `label=disable` — avoids relabeling host files (`:Z` would relabel `$PWD` and `~/.pi/agent` on the host) |
@@ -110,6 +163,16 @@ state accumulate in one place regardless of which launcher is used.
   or keep the real key outside the sandbox behind a local proxy that holds
   it and forwards to the provider — the design Pi's `containerization.md`
   documents as "Docker Sandboxes" / "OpenShell" inference routing.
+- **Installing new toolchains needs a `rw` mount.** Toolchain roots are
+  read-only by default, so `uv python install`, `uv tool install`, `uvx`,
+  `rustup update`, `pipx install` fail unless the relevant root is flipped to
+  `rw` in `toolchains.conf` (which lets writes escape the project boundary).
+  `uv sync` / `uv run` / `cargo build` do **not** need this — they only write
+  to the venv and to sandbox-local caches.
+- **Podman glibc skew.** The image is Debian, the host is Fedora. uv and
+  uv-managed Pythons are built for old glibc and run fine; most Rust and Go
+  binaries do too. But a host binary linked against a *newer* glibc than the
+  container's will not run there. bwrap has no skew (host binaries).
 - **Package installs don't persist.** `pi package add` / new extensions
   inside the sandbox write to read-only mounts; run those unsandboxed.
 - **MCP is not exposed.** `mcp.json` / `mcp-auth.json` are not mounted; add
