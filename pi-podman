@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# pi-podman — run Pi inside a rootless Podman container.
+#
+# Boundary (container namespaces + SELinux):
+#   read-write : the current working directory (mounted at the same absolute
+#                path, so sessions group identically to host runs)
+#                ~/.pi/agent/sessions (pi --continue / --resume parity)
+#                ~/.pi-sandbox-home — persistent sandbox home, shared with
+#                the bwrap variant (pi-sandbox)
+#   fresh copy : settings.json, models-store.json — Pi writes lock dirs
+#                (<file>.lock) next to these, so they must be writable;
+#                copied from the host on every launch
+#   read-only  : ~/.pi/agent — auth.json, extensions/, npm/, bin/, install/
+#   absent     : everything else on the host — other projects, ~/.ssh, ~/.gnupg
+# Network: rootless networking (pasta) — NOT isolated, provider API reachable.
+# SELinux: container label confinement is disabled (label=disable) to avoid
+#          relabeling host files; the boundary is the container namespaces.
+# Usage: pi-sandbox-podman [pi arguments]   (first run builds the image)
+
+set -euo pipefail
+
+command -v podman >/dev/null || { echo "pi-podman: podman is required" >&2; exit 1; }
+
+AGENT="$HOME/.pi/agent"
+STATE="$HOME/.pi-sandbox-home"   # shared with pi-sandbox (bwrap)
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+if [ "$PWD" = "$HOME" ]; then
+  echo "pi-podman: refusing to run with \$HOME as the working directory" >&2
+  exit 1
+fi
+mkdir -p "$STATE/.pi/agent"
+
+# Files Pi writes lock dirs next to: refresh copies each run.
+for f in settings.json models-store.json; do
+  [ -f "$AGENT/$f" ] && cp "$AGENT/$f" "$STATE/.pi/agent/$f"
+done
+
+if ! podman image exists pi-sandbox; then
+  echo "pi-podman: building image (one-time, needs network)" >&2
+  podman build -t pi-sandbox -f "$SCRIPT_DIR/Containerfile" "$SCRIPT_DIR" >&2
+fi
+
+tty_flags=()
+[ -t 0 ] && [ -t 1 ] && tty_flags=(-it)
+
+volumes=(
+  -v "$STATE:/root"
+  -v "$PWD:$PWD"
+  -v "$AGENT/auth.json:/root/.pi/agent/auth.json:ro"
+  -v "$AGENT/extensions:/root/.pi/agent/extensions:ro"
+  -v "$AGENT/npm:/root/.pi/agent/npm:ro"
+  -v "$AGENT/bin:/root/.pi/agent/bin:ro"
+  -v "$AGENT/install:/root/.pi/agent/install:ro"
+  -v "$AGENT/sessions:/root/.pi/agent/sessions"
+)
+[ -f "$AGENT/trust.json" ] && volumes+=(-v "$AGENT/trust.json:/root/.pi/agent/trust.json")
+
+exec podman run --rm \
+  "${tty_flags[@]}" \
+  --security-opt label=disable \
+  -e TERM \
+  "${volumes[@]}" \
+  -w "$PWD" \
+  pi-sandbox \
+  /root/.pi/agent/bin/pi "$@"

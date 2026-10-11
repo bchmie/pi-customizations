@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# pi-sandbox — run Pi inside a bubblewrap filesystem sandbox.
+#
+# Boundary:
+#   read-write : the current working directory
+#                ~/.pi/agent/sessions (pi --continue / --resume work as usual)
+#                ~/.pi/agent/trust.json (project-trust decisions persist)
+#                ~/.pi-sandbox-home   (persistent sandbox home)
+#   read-only  : ~/.pi/agent — auth.json, extensions/, npm/, bin/, install/
+#                /usr, /etc — the rest of the system is not mounted at all
+#   fresh copy : settings.json, models-store.json — Pi writes lock files
+#                (<file>.lock dirs) next to these, so they must be writable;
+#                they are copied from the host on every launch
+#   hidden     : everything else under $HOME — ~/.ssh, ~/.gnupg, other projects
+#   ephemeral  : /tmp, /run
+#
+# Network is NOT isolated (shares the host network namespace).
+# Usage: pi-sandbox [pi arguments]
+
+set -euo pipefail
+
+command -v bwrap >/dev/null || { echo "pi-sandbox: bwrap is required" >&2; exit 1; }
+
+AGENT="$HOME/.pi/agent"
+STATE="$HOME/.pi-sandbox-home"
+
+if [ "$PWD" = "$HOME" ]; then
+  echo "pi-sandbox: refusing to run with \$HOME as the working directory" >&2
+  exit 1
+fi
+mkdir -p "$STATE/.pi/agent"
+
+# Files Pi needs to write lock-directives next to: refresh copies each run.
+for f in settings.json models-store.json; do
+  [ -f "$AGENT/$f" ] && cp "$AGENT/$f" "$STATE/.pi/agent/$f"
+done
+
+# Mount order matters: every exception must come after the mount that covers
+# its parent (--bind "$STATE" "$HOME" shadows the real home).
+ro() { [ -e "$1" ] && mounts+=(--ro-bind "$1" "$1"); }
+
+mounts=(
+  --unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup
+  --die-with-parent
+  --ro-bind /usr /usr
+  --symlink usr/bin /bin --symlink usr/sbin /sbin
+  --symlink usr/lib /lib --symlink usr/lib64 /lib64
+  --ro-bind /etc /etc
+  --proc /proc --dev /dev
+  --tmpfs /tmp --tmpfs /run
+  --ro-bind /run/systemd/resolve /run/systemd/resolve
+  --bind "$STATE" "$HOME"
+  --bind "$PWD" "$PWD"
+)
+ro "$AGENT/auth.json"
+ro "$AGENT/extensions"
+ro "$AGENT/npm"
+ro "$AGENT/bin"
+ro "$AGENT/install"
+[ -f "$AGENT/trust.json" ] && mounts+=(--bind "$AGENT/trust.json" "$HOME/.pi/agent/trust.json")
+mounts+=(
+  --bind "$AGENT/sessions" "$HOME/.pi/agent/sessions"
+  --share-net
+  --chdir "$PWD"
+  --setenv HOME "$HOME"
+  --setenv USER "$USER"
+  --setenv SHELL "${SHELL:-/bin/bash}"
+  --setenv PATH "$AGENT/bin:/usr/local/bin:/usr/bin:/bin"
+  --setenv TERM "${TERM:-xterm-256color}"
+  --setenv LANG "${LANG:-C.UTF-8}"
+)
+[ -n "${TZ:-}" ] && mounts+=(--setenv TZ "$TZ")
+
+exec bwrap "${mounts[@]}" "$AGENT/bin/pi" "$@"
